@@ -6,30 +6,70 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
-	"golang.org/x/sync/errgroup"
 )
 
-type resolver struct {
-	topic         string
-	info          offsetInfo
-	allPartitions map[int32]bool
+func (cmd *consumeCmd) newResolver() (*resolver, error) {
+	consumer, err := sarama.NewConsumerFromClient(cmd.client)
+	if err != nil {
+		return nil, err
+	}
+	allPartitions, err := consumer.Partitions(cmd.topic)
+	if err != nil {
+		return nil, err
+	}
+	queryer := &offsetQueryer{
+		topic:    cmd.topic,
+		client:   cmd.client,
+		consumer: consumer,
+	}
+	return &resolver{
+		runQuery:      queryer.runQuery,
+		topic:         cmd.topic,
+		allPartitions: allPartitions,
+		info: offsetInfo{
+			offsets: make(map[int32]map[offsetRequest]int64),
+			resumes: make(map[int32]int64),
+			times:   make(map[int32]map[int64]time.Time),
+		},
+	}, nil
+}
 
-	client   sarama.Client
-	consumer sarama.Consumer
+// resolver is responsible for resolving a set of offsets, as parsed
+// by parseOffsets, into absolute integer offsets.
+type resolver struct {
+	// runQuery is called to make the query to kafka for all items
+	// in q, putting the results into info.
+	runQuery func(ctx context.Context, q *offsetQuery, info *offsetInfo) error
+
+	// topic holds the topic being consumed.
+	topic string
+
+	// allPartitions holds all the partition ids in the Kafka instance.
+	allPartitions []int32
+
+	// info records offset information as it's found.
+	info offsetInfo
 }
 
 type resolvedInterval struct {
 	start, end int64
 }
 
-func newResolver() *resolver {
-	return &resolver{
-		info: offsetInfo{
-			offsets: make(map[int32]map[offsetRequest]int64),
-			resumes: make(map[int32]int64),
-			times:   make(map[int32]map[int64]time.Time),
-		},
-	}
+type offsetRequest struct {
+	// timeOrOff holds the number of milliseconds since Jan 1st 1970 of the
+	// offset to request, or one of offsetResume, sarama.OldestOffset, sarama.NewestOffset
+	// if it's not a time-based request.
+	//
+	// Note that this is in the same form expected by the ListOffset Kakfa API.
+	timeOrOff int64
+}
+
+// offsetQuery represents a set of information to be asked as bulk requests
+// to the Kafka API.
+type offsetQuery struct {
+	timeQuery   map[int32]map[int64]bool
+	offsetQuery map[int32]map[offsetRequest]bool
+	resumeQuery map[int32]bool
 }
 
 func (r *resolver) resolveOffsets(ctx context.Context, offsets map[int32]interval) (map[int32]resolvedInterval, error) {
@@ -40,13 +80,13 @@ func (r *resolver) resolveOffsets(ctx context.Context, offsets map[int32]interva
 		if p == -1 {
 			continue
 		}
-		if _, ok := r.allPartitions[p]; !ok {
+		if !r.partitionExists(p) {
 			return nil, fmt.Errorf("partition %v does not exist", p)
 		}
 	}
 	if intv, ok := offsets[-1]; ok {
 		// There's an entry that signifies all partitions, so get all the partitions and fill out the map.
-		for p := range r.allPartitions {
+		for _, p := range r.allPartitions {
 			if _, ok := allOffsets[p]; !ok {
 				intv := intv
 				allOffsets[p] = &intv
@@ -88,11 +128,20 @@ func (r *resolver) resolveOffsets(ctx context.Context, offsets map[int32]interva
 				}
 			}
 		}
-		if err := r.runOffsetQuery(ctx, q); err != nil {
+		if err := r.runQuery(ctx, q, &r.info); err != nil {
 			return nil, err
 		}
 	}
 	return resolved, nil
+}
+
+func (r *resolver) partitionExists(p int32) bool {
+	for _, ap := range r.allPartitions {
+		if ap == p {
+			return true
+		}
+	}
+	return false
 }
 
 // resolvePosition tries to resolve p in the given partition from information provided in info.
@@ -162,14 +211,6 @@ func resolvePosition(partition int32, p position, info *offsetInfo, q *offsetQue
 	return p, true
 }
 
-// offsetQuery represents a set of information to be asked as bulk requests
-// to the Kafka API.
-type offsetQuery struct {
-	timeQuery   map[int32]map[int64]bool
-	offsetQuery map[int32]map[offsetRequest]bool
-	resumeQuery map[int32]bool
-}
-
 type offsetInfo struct {
 	// offsets maps from partition to offset request to offset.
 	// This holds results from both time-based queries and symbolic
@@ -203,13 +244,25 @@ func (info *offsetInfo) getOffset(p int32, req offsetRequest, q *offsetQuery) (i
 		q.resumeQuery[p] = true
 		return 0, false
 	}
-	m := q.offsetQuery[p]
-	if m == nil {
-		m = make(map[offsetRequest]bool)
-		q.offsetQuery[p] = m
+	if q.offsetQuery[p] == nil {
+		q.offsetQuery[p] = make(map[offsetRequest]bool)
 	}
-	m[req] = true
+	q.offsetQuery[p][req] = true
 	return 0, false
+}
+
+func (info *offsetInfo) setOffset(p int32, req offsetRequest, off int64) {
+	if req.timeOrOff == offsetResume {
+		panic("setOffset called with resume offset")
+	}
+	if info.offsets[p] == nil {
+		info.offsets[p] = make(map[offsetRequest]int64)
+	}
+	info.offsets[p][req] = off
+}
+
+func (info *offsetInfo) setResumeOffset(p int32, off int64) {
+	info.resumes[p] = off
 }
 
 func (info *offsetInfo) getTime(p int32, off int64, q *offsetQuery) (time.Time, bool) {
@@ -222,216 +275,18 @@ func (info *offsetInfo) getTime(p int32, off int64, q *offsetQuery) (time.Time, 
 	if ok {
 		return t, true
 	}
-	m := q.timeQuery[p]
-	if m == nil {
-		m = make(map[int64]bool)
-		q.timeQuery[p] = m
+	if q.timeQuery[p] == nil {
+		q.timeQuery[p] = make(map[int64]bool)
 	}
-	m[off] = true
+	q.timeQuery[p][off] = true
 	return time.Time{}, false
 }
 
-func (r *resolver) runOffsetQuery(ctx context.Context, q *offsetQuery) error {
-	egroup, ctx := errgroup.WithContext(ctx)
-	egroup.Go(func() error {
-		return r.getTimes(ctx, q.timeQuery)
-	})
-	egroup.Go(func() error {
-		return r.getOffsets(ctx, q.offsetQuery)
-	})
-	egroup.Go(func() error {
-		return r.getResumes(ctx, q.resumeQuery)
-	})
-	if err := egroup.Wait(); err != nil {
-		return err
+func (info *offsetInfo) setTime(p int32, off int64, t time.Time) {
+	if info.times[p] == nil {
+		info.times[p] = make(map[int64]time.Time)
 	}
-	return nil
-}
-
-func (r *resolver) getTimes(ctx context.Context, q map[int32]map[int64]bool) error {
-	type result struct {
-		partition int32
-		offset    int64
-		time      time.Time
-	}
-	resultc := make(chan result)
-	nrequests := 0
-	egroup, ctx := errgroup.WithContext(ctx)
-	for p, offsets := range q {
-		p := p
-		for offset := range offsets {
-			offset := offset
-			if offset < 0 {
-				panic("symbolic offset passed to getTime")
-			}
-			nrequests++
-			egroup.Go(func() error {
-				// We'd probably be better off calling Fetch directly, because
-				// ConsumePartition will immediately fire off another unnecessary request
-				// before we close it.
-				pconsumer, err := r.consumer.ConsumePartition(r.topic, p, offset)
-				if err != nil {
-					return err
-				}
-				defer pconsumer.Close()
-				select {
-				case m, ok := <-pconsumer.Messages():
-					if !ok {
-						return fmt.Errorf("closed messages channel")
-					}
-					resultc <- result{
-						partition: p,
-						offset:    offset,
-						time:      m.Timestamp,
-					}
-				case err := <-pconsumer.Errors():
-					// TODO what do we do about errors?
-					_ = err
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-				return nil
-			})
-		}
-	}
-	egroup.Go(func() error {
-		for i := 0; i < nrequests; i++ {
-			select {
-			case result := <-resultc:
-				m := r.info.times[result.partition]
-				if m == nil {
-					m = make(map[int64]time.Time)
-					r.info.times[result.partition] = m
-				}
-				m[result.offset] = result.time
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		return nil
-	})
-	return egroup.Wait()
-}
-
-func (r *resolver) getResumes(ctx context.Context, q map[int32]bool) error {
-	return fmt.Errorf("not yet implemented")
-	//	for p := range q {
-	//		// get partition manager for partition
-	//
-	//		info.resumes[p] = pom.NextOffset()
-	//	}
-	//	return nil
-}
-
-// getOffsets gets offsets for all the requests in q and stores the results in r.info.offsets.
-// Note that this does not resolve resume offset requests, which are handled by getResumes.
-func (r *resolver) getOffsets(ctx context.Context, q map[int32]map[offsetRequest]bool) error {
-	type result struct {
-		askFor map[int32]offsetRequest
-		resp   *sarama.OffsetResponse
-		err    error
-	}
-	// This is unbuffered so if we fail, we'll leave some dangling goroutines that will block trying to
-	// write to resultc, but as the whole command is going to exit in that case, we don't care.
-	resultc := make(chan result)
-
-	nqueries := 0
-	// We can only ask about one partition per request, so keep issuing requests
-	// until we have no more left to ask about.
-	for len(q) > 0 {
-		// We're going to issue a request for each unique broker that manages
-		// any of the partitions in the query.
-		reqs := make(map[*sarama.Broker]*sarama.OffsetRequest)
-
-		// askFor records the partitions that we're asking about,
-		// so we can make sure the broker has responded with
-		// the expected information, otherwise there's a risk
-		// that a broker with broken behaviour could cause
-		// getOffsetsForTimes to fail to fill out the required info
-		// in info, which could cause an infinite loop in the calling
-		// logic which expects all queries to get an answer.
-		askFor := make(map[*sarama.Broker]map[int32]offsetRequest)
-		for p, offqs := range q {
-			if len(offqs) == 0 {
-				// Defensive: this shouldn't happen.
-				delete(q, p)
-				continue
-			}
-			var offq offsetRequest
-			for offq = range offqs {
-				delete(offqs, offq)
-				break
-			}
-			if len(offqs) == 0 {
-				delete(q, p)
-			}
-			if offq.timeOrOff == offsetResume {
-				panic("getOffsets called with offsetResume query")
-			}
-			b, err := r.client.Leader(r.topic, p)
-			if err != nil {
-				return err
-			}
-			req := reqs[b]
-			if req == nil {
-				req = &sarama.OffsetRequest{
-					Version: 1,
-				}
-				reqs[b] = req
-				askFor[b] = make(map[int32]offsetRequest)
-			}
-			req.AddBlock(r.topic, p, offq.timeOrOff, 1)
-			askFor[b][p] = offq
-		}
-		for b, req := range reqs {
-			b, req := b, req
-			nqueries++
-			go func() {
-				// We should pass ctx here but sarama doesn't support context.
-				resp, err := b.GetAvailableOffsets(req)
-				resultc <- result{
-					askFor: askFor[b],
-					resp:   resp,
-					err:    err,
-				}
-			}()
-		}
-	}
-	for i := 0; i < nqueries; i++ {
-		select {
-		case result := <-resultc:
-			ps, ok := result.resp.Blocks[r.topic]
-			if !ok {
-				return fmt.Errorf("topic %q not found in offsets response", r.topic)
-			}
-			for p, offq := range result.askFor {
-				block, ok := ps[p]
-				if !ok {
-					return fmt.Errorf("no offset found for partition %d", p)
-				}
-				if block.Err != 0 {
-					return fmt.Errorf("cannot get offset for partition %d: %v", p, block.Err)
-				}
-				if block.Offset < 0 {
-					// This happens when the time is beyond the last offset.
-					block.Offset = sarama.OffsetNewest // TODO or newestOffset?
-				}
-				r.info.offsets[p][offq] = block.Offset
-			}
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return nil
-}
-
-type offsetRequest struct {
-	// timeOrOff holds the number of milliseconds since Jan 1st 1970 of the
-	// offset to request, or one of offsetResume, sarama.OldestOffset, sarama.NewestOffset
-	// if it's not a time-based request.
-	//
-	// Note that this is in the same form expected by the ListOffset Kakfa API.
-	timeOrOff int64
+	info.times[p][off] = t
 }
 
 func timeOffsetRequest(t time.Time) offsetRequest {
