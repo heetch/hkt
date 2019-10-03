@@ -8,21 +8,27 @@ import (
 	"github.com/Shopify/sarama"
 )
 
-func (cmd *consumeCmd) newResolver() (*resolver, error) {
-	consumer, err := sarama.NewConsumerFromClient(cmd.client)
+// resolveOffsets resolves the given per-partition intervals to absolute intervals.
+func (cmd *consumeCmd) resolveOffsets(ctx context.Context, offsets map[int32]interval) (map[int32]resolvedInterval, error) {
+	r, err := cmd.newResolver()
 	if err != nil {
 		return nil, err
 	}
-	allPartitions, err := consumer.Partitions(cmd.topic)
+	return r.resolveOffsets(ctx, offsets)
+}
+
+func (cmd *consumeCmd) newResolver() (*resolver, error) {
+	allPartitions, err := cmd.consumer.Partitions(cmd.topic)
 	if err != nil {
 		return nil, err
 	}
 	queryer := &offsetQueryer{
 		topic:    cmd.topic,
 		client:   cmd.client,
-		consumer: consumer,
+		consumer: cmd.consumer,
 	}
 	return &resolver{
+		truncate:      !cmd.follow,
 		runQuery:      queryer.runQuery,
 		topic:         cmd.topic,
 		allPartitions: allPartitions,
@@ -40,6 +46,10 @@ type resolver struct {
 	// runQuery is called to make the query to kafka for all items
 	// in q, putting the results into info.
 	runQuery func(ctx context.Context, q *offsetQuery, info *offsetInfo) error
+
+	// When truncate is true, resolved intervals will not extend beyond the
+	// end of their partition.
+	truncate bool
 
 	// topic holds the topic being consumed.
 	topic string
@@ -77,54 +87,60 @@ func (r *resolver) resolveOffsets(ctx context.Context, offsets map[int32]interva
 	for p, intv := range offsets {
 		intv := intv
 		allOffsets[p] = &intv
-		if p == -1 {
-			continue
-		}
-		if !r.partitionExists(p) {
+		if p != -1 && !r.partitionExists(p) {
 			return nil, fmt.Errorf("partition %v does not exist", p)
 		}
 	}
-	if intv, ok := offsets[-1]; ok {
-		// There's an entry that signifies all partitions, so get all the partitions and fill out the map.
-		for _, p := range r.allPartitions {
-			if _, ok := allOffsets[p]; !ok {
-				intv := intv
-				allOffsets[p] = &intv
-			}
-		}
-	}
 	resolved := make(map[int32]resolvedInterval)
-	// Some offsets can't be resolved in one query (for example,
-	// a offset like "latest-1h" will first need to resolve "latest"
-	// to the latest offset for the partition, then find the timestamp
-	// of the latest message in that partition, then find the offset
-	// of that timestamp less one house). So we keep on running
-	// queries until there are no more left, moving items out of
-	// allOffsets and into resolved when they're fully resolved.
+	// Some offsets can't be resolved in one query (for example, a
+	// offset like "latest-1h" will first need to resolve "latest"
+	// to the latest offset for the partition, then find the
+	// timestamp of the latest message in that partition, then find
+	// the offset of that timestamp less one house). So we keep on
+	// running queries until there are no more left, moving items
+	// out of allOffsets and into resolved when they're fully
+	// resolved.
+	count := 0
 	for len(allOffsets) > 0 {
+		count++
+		if count > 20 {
+			panic("probable infinite loop resolving offsets")
+		}
+		// We want to minimise the number of queries we make to
+		// the server, so instead of querying each position
+		// directly, we build up all the query requirements in
+		// q, then call runOffsetQuery which will build bulk API
+		// calls as needed, and fill in entries inside info,
+		// which can then be used to satisfy subsequent
+		// information requirements in resolvePosition.
 		q := &offsetQuery{
 			timeQuery:   make(map[int32]map[int64]bool),
 			offsetQuery: make(map[int32]map[offsetRequest]bool),
 			resumeQuery: make(map[int32]bool),
 		}
-
-		// We want to minimise the number of queries we make to the
-		// server, so instead of querying each position directly, we
-		// build up all the query requirements in q, then call runOffsetQuery
-		// which will build bulk API calls as needed, and fill in entries
-		// inside info, which can then be used to satisfy subsequent information
-		// requirements in resolvePosition.
+		r.expandAllIntervalsSpec(allOffsets, q)
 		for p, intv := range allOffsets {
+			if p == -1 {
+				continue
+			}
+			partitionMax, haveMax := lastPosition(), true
+			if r.truncate {
+				// Find out where the partition ends so we can constrain the interval.
+				partitionMax, haveMax = resolvePosition(p, newestPosition(), &r.info, q)
+			}
 			start, ok1 := resolvePosition(p, intv.start, &r.info, q)
 			end, ok2 := resolvePosition(p, intv.end, &r.info, q)
 			intv.start, intv.end = start, end
-			if ok1 && ok2 {
-				// The interval has been fully resolved.
-				// Remove it from allOffsets and add it to resolved.
+			if ok1 && ok2 && haveMax {
+				// The interval has been fully resolved,
+				// so remove it from allOffsets and add
+				// it to resolved.
 				delete(allOffsets, p)
-				resolved[p] = resolvedInterval{
-					start: start.anchor.offset,
-					end:   end.anchor.offset,
+				if start.resolved() && end.resolved() {
+					resolved[p] = resolvedInterval{
+						start: min(start.anchor.offset, partitionMax.anchor.offset),
+						end:   min(end.anchor.offset, partitionMax.anchor.offset),
+					}
 				}
 			}
 		}
@@ -133,6 +149,97 @@ func (r *resolver) resolveOffsets(ctx context.Context, offsets map[int32]interva
 		}
 	}
 	return resolved, nil
+}
+
+// expandAllIntervalsSpec expands the "all partitions" entry in offsets if present,
+// creating entries for all partitions not explicitly specified in offsets.
+//
+// If there isn't enough information in q to do that, it leaves
+// the offsets map unchanged.
+func (r *resolver) expandAllIntervalsSpec(offsets map[int32]*interval, q *offsetQuery) {
+	intv, ok := offsets[-1]
+	if !ok {
+		// No "all partitions" entry.
+		return
+	}
+	// updateTimestamp updates the "summary" timestamp *t according to p.
+	// It only affects t if p has either an "oldest" or "newest" anchor with
+	// a duration-based difference which implies that we need to find either the
+	// oldest or newest timestamp across all partitions so that the
+	// interval end time is the same across all partitions.
+	updateTimestamp := func(t *time.Time, partition int32, p position) bool {
+		if p.anchor.offset >= 0 || !p.diff.isDuration || p.anchor.offset == offsetResume {
+			// We can work out the "all" offset for each partition independently.
+			// Lacking a better idea, we leave resume as per-partition.
+			return true
+		}
+		off, ok := r.info.getOffset(partition, symbolicOffsetRequest(p.anchor.offset), q)
+		if !ok {
+			return false
+		}
+		t1, ok := r.info.getTime(partition, off, q)
+		if !ok {
+			return false
+		}
+		if t1.IsZero() {
+			// No timestamp available (probably because the partition is empty)
+			return true
+		}
+		switch p.anchor.offset {
+		case sarama.OffsetOldest:
+			if t1.Before(*t) {
+				*t = t1
+			}
+		case sarama.OffsetNewest:
+			if (*t).IsZero() || t1.After(*t) {
+				*t = t1
+			}
+		}
+		return true
+	}
+	var startTime, endTime time.Time
+	gotAll := true
+	for _, partition := range r.allPartitions {
+		if _, ok := offsets[partition]; ok {
+			// The partition was explicitly specified, so it's independent.
+			continue
+		}
+		gotAll = updateTimestamp(&startTime, partition, intv.start) && gotAll
+		gotAll = updateTimestamp(&endTime, partition, intv.end) && gotAll
+	}
+	if !gotAll {
+		return
+	}
+	// We've got enough information to fill out the offsets we need.
+	// First update the "all partitions" interval to be the correct time if needed.
+	// Note that if startTime or endTime are zero (because all partitions
+	// are empty for example), we'll leave the interval to be resolved later,
+	// which should work out fine in the end.
+	if !startTime.IsZero() {
+		intv.start.anchor.isTime = true
+		intv.start.anchor.time = startTime.Add(intv.start.diff.duration)
+		intv.start.diff = anchorDiff{}
+	}
+	if !endTime.IsZero() {
+		intv.end.anchor.isTime = true
+		intv.end.anchor.time = endTime.Add(intv.end.diff.duration)
+		intv.end.diff = anchorDiff{}
+	}
+	delete(offsets, -1)
+	for _, partition := range r.allPartitions {
+		if _, ok := offsets[partition]; ok {
+			continue
+		}
+		intv := *intv
+		offsets[partition] = &intv
+	}
+}
+
+func min(x, y int64) int64 {
+	if x < y {
+		return x
+	}
+	return y
 }
 
 func (r *resolver) partitionExists(p int32) bool {
@@ -145,12 +252,13 @@ func (r *resolver) partitionExists(p int32) bool {
 }
 
 // resolvePosition tries to resolve p in the given partition from information provided in info.
-// It reports whether the position has been successfully resolved if it succeeds.
-// On failure, it will have added at least one thing to be queried to q in
+// It reports whether the position has been resolved or cannot be resolved.
+//
+// If it returns false, it will have added at least one thing to be queried to q in
 // order to proceed with the resolution.
 //
 // The returned position is always valid, and may contain updated information.
-func resolvePosition(partition int32, p position, info *offsetInfo, q *offsetQuery) (position, bool) {
+func resolvePosition(partition int32, p position, info *offsetInfo, q *offsetQuery) (_pos position, _ok bool) {
 	if !p.anchor.isTime && p.anchor.offset >= 0 && !p.diff.isDuration && p.diff.offset == 0 {
 		return p, true
 	}
@@ -190,6 +298,11 @@ func resolvePosition(partition int32, p position, info *offsetInfo, q *offsetQue
 	t, ok := info.getTime(partition, p.anchor.offset, q)
 	if !ok {
 		return p, false
+	}
+	if t.IsZero() {
+		// No timestamp is available, so we can't resolve the position properly,
+		// so just return to unresolved position.
+		return p, true
 	}
 	// Then get the offset for the anchor time plus the anchor diff duration.
 	off, ok := info.getOffset(partition, timeOffsetRequest(t.Add(p.diff.duration)), q)
@@ -232,9 +345,6 @@ type offsetInfo struct {
 
 // getOffset returns the offset for a given time or symbolic offset.
 func (info *offsetInfo) getOffset(p int32, req offsetRequest, q *offsetQuery) (int64, bool) {
-	if req.timeOrOff >= 0 {
-		panic("getOffset called with non-symbolic offset")
-	}
 	if req.timeOrOff == offsetResume {
 		// Resume offset queries are resolved with a different kind of API request,
 		// so they go into a different field in the query.
@@ -243,6 +353,9 @@ func (info *offsetInfo) getOffset(p int32, req offsetRequest, q *offsetQuery) (i
 		}
 		q.resumeQuery[p] = true
 		return 0, false
+	}
+	if off, ok := info.offsets[p][req]; ok {
+		return off, true
 	}
 	if q.offsetQuery[p] == nil {
 		q.offsetQuery[p] = make(map[offsetRequest]bool)
@@ -266,10 +379,18 @@ func (info *offsetInfo) setResumeOffset(p int32, off int64) {
 }
 
 func (info *offsetInfo) getTime(p int32, off int64, q *offsetQuery) (time.Time, bool) {
-	// TODO Do we need to find the offset of the last entry in the stream
-	// so that we can avoid blocking?
 	if off < 0 {
 		panic("getTime called with symbolic offset")
+	}
+	// So that we can avoid blocking if the offset is beyond the end of the
+	// partition, the queryer needs the offset of the last message in the partition,
+	// so ensure that's available.
+	// If the offset is beyond the end, we won't be able to get a time
+	// for it, but we can't return an error here, so leave it to the offsetQueryer
+	// to do that for us.
+	_, ok := info.getOffset(p, symbolicOffsetRequest(sarama.OffsetNewest), q)
+	if !ok {
+		return time.Time{}, false
 	}
 	t, ok := info.times[p][off]
 	if ok {

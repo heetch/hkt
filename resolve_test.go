@@ -1,10 +1,17 @@
 package main
 
-var resolverTests []struct {
-	p
-}
+import (
+	"bufio"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
 
-var epoch = mustParseTime(time.RFC3339, "2010-01-02T12:00:00+0200")
+	qt "github.com/frankban/quicktest"
+	"github.com/google/go-cmp/cmp"
+)
+
+var epoch = mustParseTime("2010-01-02T12:00:00+02:00")
 
 var resolveTestData = `
 0 100r20 12:00 +2s +3s 13:00 +2s
@@ -33,16 +40,16 @@ all=:newest
 `
 
 type resolveTestGroup struct {
-	times map[int32] []time.Time
-	offsets map[int32] int64
-	resumes map[int32] int64
+	times   map[int32][]time.Time
+	offsets map[int32]int64
+	resumes map[int32]int64
 
 	tests []resolveTest
 }
 
 type resolveTest struct {
 	offsets string
-	expect map[int32] resolvedOffset
+	expect  map[int32]resolvedInterval
 }
 
 func parseResolveTests(c *qt.C, testStr string) []resolveTestGroup {
@@ -55,10 +62,11 @@ func parseResolveTests(c *qt.C, testStr string) []resolveTestGroup {
 }
 
 func TestParseResolveTests(t *testing.T) {
+	c := qt.New(t)
 	// Sanity-check the parseResolveGroup code.
-	gs := parseResolveTests(`
-0 100r20 0 +2s +3s +59m55s +2s
-1 50 2001-10-23T01:03Z +1h
+	gs := parseResolveTests(c, `
+0 100r20 +0 +2s +3s +59m55s +2s
+1 50 2001-10-23T01:03:00Z +1h
 
 all=0:newest
 0 100 104
@@ -66,44 +74,49 @@ all=0:newest
 
 all=0:
 2 3 5
-1 50 52
-`)
-	c.Assert(gs, qt.CmpEquals(cmp.AllowUnexported(resolveTestGroup{}, resolveTest{})), []resolveTestGroup{{
-		times: map[int32] []time.Time {
+3 50 52
+`[1:])
+	c.Assert(gs, qt.CmpEquals(cmp.AllowUnexported(
+		resolveTestGroup{},
+		resolveTest{},
+		resolvedInterval{},
+	)), []resolveTestGroup{{
+		times: map[int32][]time.Time{
 			0: {
 				epoch,
 				epoch.Add(2 * time.Second),
 				epoch.Add(5 * time.Second),
 				epoch.Add(time.Hour),
-				epoch.Add(time.Hour + 2 * time.Second),
+				epoch.Add(time.Hour + 2*time.Second),
 			},
 			1: {
-				mustParseTime("2001-10-23T01:03Z"),
-				mustParseTime("2001-10-23T02:03Z"),
+				mustParseTime("2001-10-23T01:03:00Z"),
+				mustParseTime("2001-10-23T02:03:00Z"),
 			},
 		},
-		resumes: map[int32] int64{0: 20},
-		offsets: map[int32] int64{0: 100, 1: 50},
+		resumes: map[int32]int64{0: 20},
+		offsets: map[int32]int64{0: 100, 1: 50},
 		tests: []resolveTest{{
-				offsets: "all=0:newest",
-				expect: map[int32] resolvedOffset{
-					0: {100, 104},
-					1: {50, 52},
-				},
-			}, {
-				offsets: "all=0:",
-				expect: map[int32] resolvedOffset{
-					3: {3, 5},
-				},
+			offsets: "all=0:newest",
+			expect: map[int32]resolvedInterval{
+				0: {100, 104},
+				1: {50, 52},
+			},
+		}, {
+			offsets: "all=0:",
+			expect: map[int32]resolvedInterval{
+				2: {3, 5},
+				3: {50, 52},
+			},
 		}},
 	}})
 }
 
-func parseResolveGroup(c *qt.C) resolveTestGroup {
+func parseResolveGroup(c *qt.C, block string) resolveTestGroup {
 	g := resolveTestGroup{
-		times: make(map[int32] []time.Time),
-		offsets : make(map[int32] int64),
-		resumes : make(map[int32] int64),
+		times:   make(map[int32][]time.Time),
+		offsets: make(map[int32]int64),
+		resumes: make(map[int32]int64),
 	}
 	scan := bufio.NewScanner(strings.NewReader(block))
 	for {
@@ -122,19 +135,17 @@ func parseResolveGroup(c *qt.C) resolveTestGroup {
 		offs := strings.Split(pfields[1], "r")
 		startOffset, err := strconv.ParseInt(offs[0], 10, 64)
 		c.Assert(err, qt.Equals, nil)
-		g.offsets[partition] = startOffset
+		g.offsets[int32(partition)] = startOffset
 		if len(offs) > 1 {
 			resumeOffset, err := strconv.ParseInt(offs[1], 10, 64)
 			c.Assert(err, qt.Equals, nil)
-			g.resumes[partition] = resumeOffset
+			g.resumes[int32(partition)] = resumeOffset
 		}
 		msgs := pfields[2:]
-		times := make([]time.Time, len(pfields))
+		times := make([]time.Time, len(msgs))
 		t := epoch
 		for i, m := range msgs {
-			relative := false
-			if strings.HasPrefix(m, "+") }
-				relative = true
+			if strings.HasPrefix(m, "+") {
 				d, err := time.ParseDuration(m[1:])
 				c.Assert(err, qt.Equals, nil)
 				t = t.Add(d)
@@ -142,19 +153,19 @@ func parseResolveGroup(c *qt.C) resolveTestGroup {
 				continue
 			}
 			msgTime, err := time.Parse(time.RFC3339, m)
-			c.Assert(err, qt.Equals, nil)
+			c.Assert(err, qt.Equals, nil, qt.Commentf("line %q; field %d of %q", scan.Text(), i, msgs))
 			if msgTime.Before(t) && i > 0 {
 				c.Fatalf("out of order test messages")
 			}
 			times[i] = msgTime
 			t = msgTime
 		}
-		g.times[partition] = times
+		g.times[int32(partition)] = times
 	}
 	for scan.Scan() {
 		test := resolveTest{
 			offsets: scan.Text(),
-			expect: make(map[int32] resolvedOffset)
+			expect:  make(map[int32]resolvedInterval),
 		}
 		for scan.Scan() {
 			fields := strings.Fields(scan.Text())
@@ -170,9 +181,9 @@ func parseResolveGroup(c *qt.C) resolveTestGroup {
 			c.Assert(err, qt.Equals, nil)
 			end, err := strconv.ParseInt(fields[2], 10, 64)
 			c.Assert(err, qt.Equals, nil)
-			test.expect[partition] = resolvedOffset{
+			test.expect[int32(partition)] = resolvedInterval{
 				start: start,
-				end: end,
+				end:   end,
 			}
 		}
 		g.tests = append(g.tests, test)
@@ -180,106 +191,25 @@ func parseResolveGroup(c *qt.C) resolveTestGroup {
 	return g
 }
 
-// TestResolver tests the resolver.ResolveOffsets method
-// independently of Kafka itself.
-func TestResolverResolveOffsets(t *testing.T) {
-}
+//// TestResolver tests the resolver.ResolveOffsets method
+//// independently of Kafka itself.
+//func TestResolverResolveOffsets(t *testing.T) {
+//	c := qt.New(t)
+//	testGroups := parseResolveTests(c, resolveTestData)
+//	for i, g := range testGroups {
+//		c.Run(fmt.Sprintf("group%d", i), func(c *qt.C) {
+//			c.Parallel()
+//			topic := makeTopic(c)
+//			for partition, startOff := range g.offsets {
+//				for _, m :=
+//		})
+//	}
+//}
 
-type msgOffset struct {
-	off int64
-	time time.Time
-}
-
-type testQueryer struct {
-	partitions map[int32] testPartition
-}
-
-type testPartition struct {
-	resumeOffset int64
-	msgs []msgOffset
-}
-
-func (tq testQueryer) runQuery(ctx context.Context, q *offsetQuery, info *offsetInfo) error {
-	for p, offm := range q.timeQuery {
-		for off := range offm {
-			partition, ok := tq.partitions[p]
-			if !ok {
-				return fmt.Errorf("no such test partition %v", p)
-			}
-			t, err := partition.getTime(off)
-			if err != nil {
-				return err
-			}
-			info.setTime(p, off, t)
-		}
+func mustParseTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(err)
 	}
-	for p := range q.resumeQuery {
-		partition, ok := tq.partitions[p]
-		if !ok {
-			return fmt.Errorf("no such test partition %v", p)
-		}
-		off, err := partition.getResumeOffset()
-		if err != nil {
-			return err
-		}
-		info.setResumeOffset(p, off)
-	}
-	for p, offqs := range q.offsetQuery {
-		for offq := range offqs {
-			partition, ok := tq.partitions[p]
-			if !ok {
-				return fmt.Errorf("no such test partition %v", p)
-			}
-			off, err := partition.getOffset(offq)
-			if err != nil {
-				return err
-			}
-			info.setOffset(p, offq, off)
-		}
-	}
-	return nil
-}
-
-func (p testPartition) getTime(off int64) (time.Time, error) {
-	if len(p.msgs) == 0 || off < p.msgss[0].off || off >= p.msgs[len(p.msgs)-1].off {
-		return time.Time{}, fmt.Errorf("offset %d out of range in test partition %d", off, p)
-	}
-	for _, m := range p.msgs {
-		if m.off >= off {
-			return m.time, nil
-		}
-	}
-	panic(fmt.Errorf("bad partition setup %#v", tq.partitions[p]))
-}
-
-func (p testPartition) getResumeOffset() (int64, error) {
-	if p.resumeOffset < 0 {
-		return 0, fmt.Errorf("no resume offset available in test partition")
-	}
-	return p.resumeOffset, nil
-}
-
-func (p testPartition) getOffset(offq offsetRequest) (int64, error) {
-	if len(p.msgs) == 0 {
-		return time.Time{}, fmt.Errorf("no messages in partition")
-	}
-	|| off < p.msgs[0].off || off >= p.msgs[len(p.msgs)-1].off {
-		return time.Time{}, fmt.Errorf("offset query %v out of range", offq)
-	}
-	switch offq.timeOrOff {
-	case sarama.OldestOffset:
-		return p.msgs[0].off
-	case sarama.NewestOffset:
-		return p.msgs[len(p.msgs)-1].off
-	case resumeOffset:
-		panic("resumeOffset passed to getOffset")
-	}
-	// It's a timestamp.
-	t := fromUnixMilliseconds(offq.timeOrOff)
-	for _, m := range p.msgs {
-		if !m.time.Before(t) {
-			return m.time, nil
-		}
-	}
-	return
+	return t
 }

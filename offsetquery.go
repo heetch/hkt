@@ -43,6 +43,10 @@ func (r *offsetQueryer) getTimes(ctx context.Context, q map[int32]map[int64]bool
 	egroup, ctx := errgroup.WithContext(ctx)
 	for p, offsets := range q {
 		p := p
+		// getOffset should never fail because getTime should have ensured
+		// that the newest-offset info is present. If it does, it'll panic before
+		// it returns due to assigning to the new query value.
+		newestOffset, _ := info.getOffset(p, symbolicOffsetRequest(sarama.OffsetNewest), nil)
 		for offset := range offsets {
 			offset := offset
 			if offset < 0 {
@@ -50,29 +54,31 @@ func (r *offsetQueryer) getTimes(ctx context.Context, q map[int32]map[int64]bool
 			}
 			nrequests++
 			egroup.Go(func() error {
-				// We'd probably be better off calling Fetch directly, because
-				// ConsumePartition will immediately fire off another unnecessary request
-				// before we close it.
-				pconsumer, err := r.consumer.ConsumePartition(r.topic, p, offset)
-				if err != nil {
-					return err
+				consumeOffset := offset
+				if consumeOffset == newestOffset && newestOffset > 0 {
+					// We're asking about the time of the newest offset. Although the newest
+					// offset is one beyond the last message, we make a special case
+					// for this, as finding the time of the last message is common.
+					consumeOffset--
 				}
-				defer pconsumer.Close()
-				select {
-				case m, ok := <-pconsumer.Messages():
-					if !ok {
-						return fmt.Errorf("closed messages channel")
-					}
+				if consumeOffset >= newestOffset {
+					// No way to know what the timestamp is, so send a zero timestamp
+					// to signify that fact.
 					resultc <- result{
 						partition: p,
 						offset:    offset,
-						time:      m.Timestamp,
 					}
-				case err := <-pconsumer.Errors():
-					// TODO what do we do about errors?
-					_ = err
-				case <-ctx.Done():
-					return ctx.Err()
+					return nil
+				}
+				// TODO batch fetch requests.
+				mt, err := fetchOneMessageTimestamp(r.client, r.topic, p, consumeOffset)
+				if err != nil {
+					return err
+				}
+				resultc <- result{
+					partition: p,
+					offset:    offset,
+					time:      mt,
 				}
 				return nil
 			})
@@ -93,6 +99,9 @@ func (r *offsetQueryer) getTimes(ctx context.Context, q map[int32]map[int64]bool
 }
 
 func (r *offsetQueryer) getResumes(ctx context.Context, q map[int32]bool, info *offsetInfo) error {
+	if len(q) == 0 {
+		return nil
+	}
 	return fmt.Errorf("not yet implemented")
 	//	for p := range q {
 	//		// get partition manager for partition
@@ -201,4 +210,47 @@ func (r *offsetQueryer) getOffsets(ctx context.Context, q map[int32]map[offsetRe
 		}
 	}
 	return nil
+}
+
+func fetchOneMessageTimestamp(client sarama.Client, topic string, partition int32, offset int64) (time.Time, error) {
+	b, err := client.Leader(topic, partition)
+	if err != nil {
+		return time.Time{}, err
+	}
+	req := &sarama.FetchRequest{
+		MinBytes:    1,
+		MaxWaitTime: 1,
+		// TODO better version-picking logic.
+		Version: 4,
+	}
+	req.AddBlock(topic, partition, offset, 1024*1024)
+	resp, err := b.Fetch(req)
+	if err != nil {
+		return time.Time{}, err
+	}
+	block := resp.Blocks[topic][partition]
+	if block == nil {
+		return time.Time{}, fmt.Errorf("no block found in response")
+	}
+	if block.Err != 0 {
+		// possible errors:
+		// ErrOffsetOutOfRange:
+		// ErrUnknownTopicOrPartition, ErrNotLeaderForPartition, ErrLeaderNotAvailable, ErrReplicaNotAvailable:
+		return time.Time{}, fmt.Errorf("fetch error: %v", block.Err)
+	}
+	if len(block.RecordsSet) == 0 {
+		return time.Time{}, fmt.Errorf("no record sets found in fetch response")
+	}
+	for _, records := range block.RecordsSet {
+		batch := records.RecordBatch
+		if batch == nil {
+			return time.Time{}, fmt.Errorf("can't deal with legacy fetch response")
+		}
+		for _, r := range batch.Records {
+			if batch.FirstOffset+r.OffsetDelta >= offset {
+				return batch.FirstTimestamp.Add(r.TimestampDelta), nil
+			}
+		}
+	}
+	return time.Time{}, fmt.Errorf("no record found")
 }
