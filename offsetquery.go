@@ -170,6 +170,9 @@ func (r *offsetQueryer) getOffsets(ctx context.Context, q map[int32]map[offsetRe
 	for i := 0; i < nqueries; i++ {
 		select {
 		case result := <-resultc:
+			if result.err != nil {
+				return fmt.Errorf("cannot get available offsets: %v", result.err)
+			}
 			ps, ok := result.resp.Blocks[r.topic]
 			if !ok {
 				return fmt.Errorf("topic %q not found in offsets response", r.topic)
