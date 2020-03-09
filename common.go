@@ -37,11 +37,12 @@ func listenForInterrupt(q chan struct{}) {
 var defaultKafkaVersion = sarama.V2_0_0_0
 
 type commonFlags struct {
-	verbose    bool
-	version    sarama.KafkaVersion
-	tlsCA      string
-	tlsCert    string
-	tlsCertKey string
+	verbose      bool
+	version      sarama.KafkaVersion
+	tlsRequested bool
+	tlsCA        string
+	tlsCert      string
+	tlsCertKey   string
 
 	brokerStrs []string
 }
@@ -61,6 +62,7 @@ func (f *commonFlags) addFlags(flags *flag.FlagSet) {
 	f.version = defaultKafkaVersion
 	flags.Var(listFlag{&f.brokerStrs}, "brokers", "Comma-separated list of brokers.  Each broker definition may optionally contain a port number. The port defaults to 9092 when omitted.")
 	flags.Var(kafkaVersionFlag{v: &f.version}, "version", "Kafka protocol version")
+	flags.BoolVar(&f.tlsRequested, "tls", false, "Request server-side TLS without client-side.")
 	flags.StringVar(&f.tlsCA, "tlsca", "", "Path to the TLS certificate authority file")
 	flags.StringVar(&f.tlsCert, "tlscert", "", "Path to the TLS client certificate file")
 	flags.StringVar(&f.tlsCertKey, "tlscertkey", "", "Path to the TLS client certificate key file")
@@ -83,6 +85,10 @@ func (f *commonFlags) saramaConfig(name string) (*sarama.Config, error) {
 	tlsConfig, err := setUpCerts(f.tlsCert, f.tlsCA, f.tlsCertKey)
 	if err != nil {
 		return nil, fmt.Errorf("cannot set up certificates: %v", err)
+	}
+	if tlsConfig == nil && f.tlsRequested {
+		// client-side not configured, but server-side TLS requested
+		tlsConfig = &tls.Config{}
 	}
 	if tlsConfig != nil {
 		cfg.Net.TLS.Enable = true
