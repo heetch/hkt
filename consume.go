@@ -353,9 +353,11 @@ func (cmd *consumeCmd) encodeAvro(data []byte) (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot get schema for id %d: %v", id, err)
 	}
-	codec, err := goavro.NewCodec(schema.String())
+	// Canonicalize the schema to remove default values and logical types
+	// to work around https://github.com/linkedin/goavro/issues/198
+	codec, err := goavro.NewCodec(schema.CanonicalString(0))
 	if err != nil {
-		return nil, fmt.Errorf("cannot create codec from schema %s", schema.String())
+		return nil, fmt.Errorf("cannot create codec from schema %s: %v", schema, err)
 	}
 	native, _, err := codec.NativeFromBinary(body)
 	if err != nil {
